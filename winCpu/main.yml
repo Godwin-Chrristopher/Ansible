@@ -1,0 +1,64 @@
+---
+- name: Handle High CPU Utilization Incident on Windows
+  hosts: localhost
+  gather_facts: no
+  vars:
+    servicenow_user: "{{ lookup('env', 'SN_USERNAME') }}"
+    servicenow_password: "{{ lookup('env', 'SN_PASSWORD') }}"
+    SSH_USERNAME: "{{ lookup('env', 'SSH_USERNAME') }}"
+    SSH_PASSWORD: "{{ lookup('env', 'SSH_PASSWORD') }}"
+    cpu_threshold: 80
+    poll_interval: 10
+    poll_count: 3
+
+  tasks:
+
+    - name: Gather facts for localhost to get date/time
+      setup:
+      delegate_to: localhost
+      delegate_facts: yes 
+    
+    - name: Fetch incidents from ServiceNow
+      uri:
+        url: "https://mrcglobaltest.service-now.com/api/now/table/incident?sysparm_query=short_description%3DALERT%20MONITORING%20--%20_MRC%20Basic%20Monitoring%20-%20Server%20CPU%20Alert%20--%20%2099%20%25%20CPULoad%20on%20na3srvdmssql01t%5Estate%3D9&sysparm_display_value=true"
+        method: GET
+        user: "{{ servicenow_user }}"
+        password: "{{ servicenow_password }}"
+        force_basic_auth: yes
+        body_format: json
+        return_content: yes
+      register: incident_data
+      # New: Handle potential ServiceNow API errors
+      failed_when: incident_data.status != 200 or not incident_data.json.result is defined
+
+    - name: Fail if no incidents are found
+      fail:
+        msg: "No incidents found matching the query in ServiceNow."
+      when: incident_data.json.result | length == 0
+
+    - name: Create list of incidents with number, hostname, and sys_id
+      set_fact:
+        incident_list_for_loop: >
+          [ {% for item in incident_data.json.result %}
+              {
+                "incident_number": "{{ item.number }}",
+                "hostname": "{{ item.cmdb_ci.display_value }}",
+                "sys_id": "{{ item.sys_id }}"
+              }{% if not loop.last %},{% endif %}
+            {% endfor %} ]
+      # New: Only proceed if incident_data.json.result is defined and not empty
+      when: incident_data.json.result is defined and incident_data.json.result | length > 0
+
+    - name: Process each incident and server
+      include_tasks: cpu_poll_and_update.yml
+      loop: "{{ incident_list_for_loop }}"
+      loop_control:
+        loop_var: current_incident_item # Renamed for clarity within the loop
+        label: "{{ current_incident_item.incident_number }} -> {{ current_incident_item.hostname }}"
+      # New: Only loop if incident_list_for_loop is defined (which it will be if incidents are found)
+      when: incident_list_for_loop is defined and incident_list_for_loop | length > 0
+
+    - name: Report if no incidents were processed
+      debug:
+        msg: "No incidents were processed due to no incidents being found or an API error."
+      when: incident_list_for_loop is not defined or incident_list_for_loop | length == 0
