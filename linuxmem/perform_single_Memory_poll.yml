@@ -1,0 +1,105 @@
+# perform_single_Memory_poll.yml
+# This file performs ONE Memory poll and updates the ServiceNow incident with its results.
+
+- name: Get current Memory usage on {{ current_incident_item.hostname }} (Poll {{ current_poll_iteration }}/{{ poll_count }})
+  shell: |
+    awk '/MemTotal/{total=$2}/MemFree/{free=$2}/Buffers/{buffers=$2}/Cached/{cached=$2}/SReclaimable/{sreclaimable=$2}END{used_kb=total-(free+buffers+cached+sreclaimable); printf "%.2f%%\n", (used_kb/total)*100}' /proc/meminfo
+  register: current_Memory_poll_result
+  delegate_to: "{{ current_incident_item.hostname }}.mcjunkinredman.com"
+  ignore_errors: true # Allow individual polls to fail without stopping the sequence
+
+- name: Get current Memory top processes on {{ current_incident_item.hostname }} (Poll {{ current_poll_iteration }}/{{ poll_count }})
+  shell: |
+                # Get top 11 processes by memory, including the header line
+                PS_OUTPUT=$(ps aux --sort -%mem | head -n 11)
+            
+                # Use awk to parse the PS_OUTPUT and generate an HTML table rows
+                TOP_PROCESS_HTML_ROWS=$(echo "$PS_OUTPUT" | awk '
+                BEGIN {
+                    # Optional: any setup you need at the beginning of the script
+                }
+            
+                # Print data rows only (skipping the header)
+                NR > 1 {
+                    pid = $2
+                    cpu_usage = $3
+                    memory_kb = $6
+                    process_name = $11
+            
+                    # Calculate memory in MB and remove path from process name
+                    memory_mb = memory_kb / 1024
+                    sub(".*/", "", process_name)
+            
+                    # Print the HTML table row
+                    printf "<tr><td>%s</td><td>%s</td><td>%.2f</td><td>%.2f</td></tr>\n", pid, process_name, cpu_usage, memory_mb
+                }
+            
+                END {
+                    # Optional: any cleanup you need at the end
+                }')
+            
+                # Output the complete HTML document
+                echo "<html><head><style>"
+                echo "body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f4f4f4; }"
+                echo ".container { max-width: 700px; margin: 30px auto; padding: 25px; background: white; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }"
+                echo "h2 { color: #2c3e50; }"
+                echo "p { font-size: 16px; }"
+                echo "table { width: 100%; border-collapse: collapse; margin-top: 20px; }"
+                echo "th, td { border: 1px solid #ddd; padding: 12px; }"
+                echo "th { background-color: #3498db; color: white; }"
+                echo "tr:nth-child(even) { background-color: #f9f9f9; }"
+                echo "tr:hover { background-color: #f1f1f1; }"
+                echo "</style></head><body>"
+                echo "<div class=\"container\">"
+                echo "<h2>Top 10 Processes by Memory Usage</h2>"
+                echo "<p>This report displays the processes consuming the most memory on the system.</p>"
+                echo "<table>"
+                echo "<thead><tr>"
+                echo "<th>PID</th>"
+                echo "<th>Process Name</th>"
+                echo "<th>CPU %</th>"
+                echo "<th>Memory (MB)</th>"
+                echo "</tr></thead><tbody>"
+                echo "$TOP_PROCESS_HTML_ROWS"
+                echo "</tbody></table>"
+                echo "</div></body></html>"
+  register: current_Memory_top_result
+  delegate_to: "{{ current_incident_item.hostname }}.mcjunkinredman.com"
+  ignore_errors: true # Allow individual commands to fail
+
+- name: Set poll-specific comment message for incident {{ current_incident_item.incident_number }}
+  set_fact:
+    poll_comment_message: |
+      Automated Poll Update {{ current_poll_iteration }}/{{ poll_count }}:
+      Current Memory on {{ current_incident_item.hostname }}: {{ current_Memory_poll_result.stdout | default('N/A') }}%.
+      Top processes:
+      [code]
+      {{ current_Memory_top_result.stdout | default('Failed to retrieve top processes for this poll.') }}
+      [/code]
+
+- name: Update ServiceNow incident {{ current_incident_item.incident_number }} with poll details
+  uri:
+    url: "https://mrcglobaltest.service-now.com/api/now/table/incident/{{ current_incident_item.sys_id }}"
+    method: PATCH
+    user: "{{ servicenow_user }}"
+    password: "{{ servicenow_password }}"
+    force_basic_auth: yes
+    body_format: json
+    headers:
+      Content-Type: "application/json"
+    body:
+      comments: "{{ poll_comment_message }}"
+  register: servicenow_poll_update_result
+  failed_when: servicenow_poll_update_result.status not in [200, 201, 202, 204]
+  ignore_errors: true # Ensure the playbook continues even if this specific update fails
+
+# Crucial: Add the current poll's raw Memory data to a list for later average/max calculation
+- name: Store current poll data for aggregation
+  set_fact:
+    # Append the current Memory value (converted to int, default to 0 if failed)
+    # to the Memory_values list. Initialize if it's the first poll.
+    Memory_values_per_poll: "{{ Memory_values_per_poll | default([]) + [current_Memory_poll_result.stdout | default(0) | int] }}"
+  delegate_to: localhost # This set_fact must run on the controller
+  run_once: true # Ensure this doesn't create duplicate entries if delegated multiple times (though delegate_to should handle this)
+  # The when condition here ensures we only append if a value was actually retrieved, or at least a default of 0 is used.
+  when: current_Memory_poll_result.stdout is defined or current_Memory_poll_result.failed is defined
