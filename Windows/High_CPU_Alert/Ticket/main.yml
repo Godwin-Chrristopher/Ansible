@@ -22,7 +22,7 @@
     
     - name: Fetch incidents from ServiceNow
       uri:
-        url: "https://service-now.com/api/now/table/incident?sysparm_query=short_descriptionLIKEALERT%20MONITORING%20--%20_Basic%20Monitoring%20-%20Server%20CPU%20Alert%20--%5Estate%3D9%5Eassignment_group%####################################%5EdescriptionLIKEWindows%5EORdescriptionLIKEHyper-V&sysparm_display_value=true"
+        url: "https://service-now.com/api/now/table/incident?sysparm_query=short_descriptionLIKEALERT%20MONITORING%20--%20_Basic%20Monitoring%20-%20Server%20CPU%20Alert%20--%5Estate%3D2%5Eassignment_group%####################################%5EdescriptionLIKEWindows%5EORdescriptionLIKEHyper-V&sysparm_display_value=true"
         method: GET
         user: "{{ servicenow_user }}"
         password: "{{ servicenow_password }}"
