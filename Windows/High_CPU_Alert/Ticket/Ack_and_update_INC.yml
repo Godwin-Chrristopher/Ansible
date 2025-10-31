@@ -1,0 +1,77 @@
+---
+# New: Block to handle tasks for a single incident, with rescue for host-specific errors
+  - name: Set  messages
+    set_fact:
+      message: |
+        Investigating the High CPU ALert on server {{ current_incident_item.hostname }}.mcjunkinredman.com
+
+  - name: Ensure CSV file exists
+    ansible.builtin.file:
+      path: "{{ ack_inc }}"
+      state: touch
+      mode: "0644"
+    delegate_to: "{{ csv_host }}"
+    vars:
+      ansible_user: "{{ ssh_user }}"
+      ansible_password: "{{ ssh_password }}"
+      ansible_connection: ssh
+      ansible_port: "{{ ssh_port }}"
+    run_once: true
+  
+  - name: Append or increment CSV counter
+    ansible.builtin.shell: |
+      echo "{{ current_incident_item.incident_number }},{{ current_incident_item.hostname }},{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}" >> "{{ ack_inc }}"
+    delegate_to: "{{ csv_host }}"
+    vars:
+      ansible_user: "{{ ssh_user }}"
+      ansible_password: "{{ ssh_password }}"
+      ansible_connection: ssh
+      ansible_port: "{{ ssh_port }}"
+    changed_when: false
+        
+  - name: Update ServiceNow incident {{ current_incident_item.incident_number }} (Group and user)
+    uri:
+      url: "https://service-now.com/api/now/table/incident/{{ current_incident_item.sys_id }}"
+      method: PATCH
+      user: "{{ servicenow_user }}"
+      password: "{{ servicenow_password }}"
+      force_basic_auth: yes
+      body_format: json
+      status_code: [200, 201, 202, 204]
+      headers:
+        Content-Type: "application/json"
+      body: >-
+        {% set body_data = {} %}
+        {% set _ = body_data.update({
+                    'assigned_to': 'User',
+                    'assignment_group': 'Group',
+                    'comments': message | default('Investigating the High CPU ALert on server.')
+                  }) %}
+        {{ body_data | to_json }}
+    register: servicenow_update_result
+    # Ensure this update attempt doesn't fail the playbook completely
+    ignore_errors: true
+    when: current_incident_item.sys_id is defined # Only attempt if sys_id is available
+
+  - name: Update ServiceNow incident {{ current_incident_item.incident_number }} (in-Progress)
+    uri:
+      url: "https://service-now.com/api/now/table/incident/{{ current_incident_item.sys_id }}"
+      method: PATCH
+      user: "{{ servicenow_user }}"
+      password: "{{ servicenow_password }}"
+      force_basic_auth: yes
+      body_format: json
+      status_code: [200, 201, 202, 204]
+      headers:
+        Content-Type: "application/json"
+      body: >-
+        {% set body_data = {} %}
+        {% set _ = body_data.update({
+                    'state': '2',
+                    'comments': 'Investigating the High CPU ALert on server, Moving the Incident to the inprogress state.'
+                  }) %}
+        {{ body_data | to_json }}
+    register: servicenow_update_result
+    # Ensure this update attempt doesn't fail the playbook completely
+    ignore_errors: true
+    when: current_incident_item.sys_id is defined # Only attempt if sys_id is available
