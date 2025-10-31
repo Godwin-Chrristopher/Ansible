@@ -12,7 +12,7 @@
     win_transport: "ntlm"
     win_validate_certs: "ignore"
     ssh_port: "22"
-    domain_suffix: "mcjunkinredman.com"
+    domain_suffix: ".com"
     csv_host: Host
     csv_path: "/data/INC_CSV/cpu_incidents.csv"
     failed_server: "/data/INC_CSV/cpu_incidents_failed.csv"
