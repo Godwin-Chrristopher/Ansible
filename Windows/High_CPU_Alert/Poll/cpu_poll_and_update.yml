@@ -426,14 +426,14 @@
                           }) %}
               {% elif alert_count is defined and alert_count | int >= 10 %}
                 {% set _ = body_data.update({
-                            'state': '2',
+                            'state': '1',
                             'assigned_to': '',
                             'comments': comment_message | default('Recurring high CPU detected.'),
                             'work_notes': comment_message | default('Recurring high CPU detected.')
                           }) %}
               {% else %}
                 {% set _ = body_data.update({
-                            'state': '2',
+                            'state': '1',
                             'assigned_to': '',
                             'comments': comment_message | default('CPU still high, investigation needed.')
                           }) %}
