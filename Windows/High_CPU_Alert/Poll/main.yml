@@ -1,0 +1,209 @@
+---
+- name: Handle High CPU Incidents
+  hosts: localhost
+  gather_facts: no
+  vars:
+    # ===== ServiceNow Credentials =====
+    servicenow_instance: "https://service-now.com"
+    servicenow_user: "{{ lookup('env', 'SN_USERNAME') }}"
+    servicenow_password: "{{ lookup('env', 'SN_PASSWORD') }}"
+    ssh_user: "{{ lookup('env', 'SSH_USERNAME') }}"
+    ssh_password: "{{ lookup('env', 'SSH_PASSWORD') }}"
+    win_transport: "ntlm"
+    win_validate_certs: "ignore"
+    ssh_port: "22"
+    domain_suffix: "mcjunkinredman.com"
+    csv_host: Host
+    csv_path: "/data/INC_CSV/cpu_incidents.csv"
+    failed_server: "/data/INC_CSV/cpu_incidents_failed.csv"
+    time_now: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}"
+
+  tasks:
+
+      - name: Fetch in-progress CPU incidents from ServiceNow
+        uri:
+          url: "https://service-now.com/api/now/table/incident?sysparm_query=short_descriptionLIKEALERT%20MONITORING%20--%20Basic%20Monitoring%20-%20Server%20CPU%20Alert%20--%5Estate%3D2%5Eassignment_group%3D1031be891b60f4506958a8292a4bcb22%5Eassigned_to%#######################%5EdescriptionLIKEWindows%5EORdescriptionLIKEHyper-V&sysparm_display_value=true"
+          method: GET
+          user: "{{ servicenow_user }}"
+          password: "{{ servicenow_password }}"
+          force_basic_auth: yes
+          validate_certs: no
+          body_format: json
+          return_content: yes
+        register: incident_data
+
+      - name: Create list of incidents with number, hostname, and sys_id
+        set_fact:
+          incident_list_for_loop: "{{ incident_data.json.result | list }}"
+        when: incident_data.json.result is defined and incident_data.json.result | length > 0
+  
+      - name: Exit play gracefully if no incidents found
+        when: incident_data.json.result | length == 0
+        meta: end_play
+
+      - name: Ensure CSV directory exists
+        ansible.builtin.file:
+          path: "{{ csv_path | dirname }}"
+          state: directory
+        delegate_to: "{{ csv_host }}"
+        vars:
+          ansible_user: "{{ ssh_user }}"
+          ansible_password: "{{ ssh_password }}"
+          ansible_connection: ssh
+          ansible_port: "{{ ssh_port }}"
+        run_once: true
+  
+      - name: Ensure CSV file exists
+        ansible.builtin.file:
+          path: "{{ csv_path }}"
+          state: touch
+          mode: "0644"
+        delegate_to: "{{ csv_host }}"
+        vars:
+          ansible_user: "{{ ssh_user }}"
+          ansible_password: "{{ ssh_password }}"
+          ansible_connection: ssh
+          ansible_port: "{{ ssh_port }}"
+        run_once: true
+  
+      - name: Ensure CSV header is correct
+        ansible.builtin.shell: |
+          set -e
+          CSV="{{ csv_path }}"
+          HEADER="INC,Server,Sys_id,CPU%,Timestamp"
+          if [ ! -s "$CSV" ] || ! head -1 "$CSV" | grep -q "^$HEADER$"; then
+            tmp="${CSV}.tmp"
+            echo "$HEADER" > "$tmp"
+            if [ -s "$CSV" ]; then
+              tail -n +2 "$CSV" | grep -v '^[[:space:]]*$' >> "$tmp" || true
+            fi
+            mv "$tmp" "$CSV"
+          fi
+        delegate_to: "{{ csv_host }}"
+        vars:
+          ansible_user: "{{ ssh_user }}"
+          ansible_password: "{{ ssh_password }}"
+          ansible_connection: ssh
+          ansible_port: "{{ ssh_port }}"
+        changed_when: false
+        run_once: true
+      
+      - name: Debug incident_list_for_loop items
+        debug:
+          msg:
+            - "Adding host: {{ item.cmdb_ci.display_value }}.{{ domain_suffix }}"
+            - "Incident number: {{ item.number }}"
+            - "Sys ID: {{ item.sys_id }}"
+        loop: "{{ incident_list_for_loop }}"
+
+      - name: Add Windows hosts to runtime inventory with incident data
+        add_host:
+          name: "{{ item.cmdb_ci.display_value }}.{{ domain_suffix }}"
+          groups: dynamic_windows_targets  
+          ansible_connection: winrm
+          ansible_winrm_transport: "ntlm"
+          ansible_winrm_server_cert_validation: "ignore"
+          ansible_port: 5985
+          ansible_user: "{{ ansible_user }}"
+          ansible_password: "{{ ansible_password }}"
+          incident_number: "{{ item.number }}"
+          sys_id: "{{ item.sys_id }}"
+        loop: "{{ incident_list_for_loop }}"
+
+      - name: Show hostvars for each dynamic Windows target
+        debug:
+          msg:
+            - "Host: {{ item }}"
+            - "Incident number: {{ hostvars[item].incident_number }}"
+            - "Sys ID: {{ hostvars[item].sys_id }}"
+        loop: "{{ groups['dynamic_windows_targets'] }}"
+        
+      - name: Show all hosts in dynamic_windows_targets group
+        debug:
+          var: groups['dynamic_windows_targets']
+
+- name: Handle High CPU Incidents on Windows Targets
+  hosts: dynamic_windows_targets
+  gather_facts: no
+  serial: 1
+  vars:
+    servicenow_instance: "https://service-now.com"
+    servicenow_user: "{{ lookup('env', 'SN_USERNAME') }}"
+    servicenow_password: "{{ lookup('env', 'SN_PASSWORD') }}"
+    ssh_user: "{{ lookup('env', 'SSH_USERNAME') }}"
+    ssh_password: "{{ lookup('env', 'SSH_PASSWORD') }}"
+    ssh_port: 22
+    csv_host: Host
+    csv_path: "/data/INC_CSV/cpu_incidents.csv"
+    cpu_threshold: 90
+    poll_count: 3
+    time_now: "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}"
+
+  tasks:
+
+    - name: Check WinRM connectivity before polling
+      win_ping:
+      register: winrm_check
+      ignore_unreachable: yes
+      ignore_errors: yes
+
+    - name: Handle unreachable Windows hosts
+      when: winrm_check is failed or winrm_check.unreachable is defined and winrm_check.unreachable | bool
+      block:
+        - name: Log unreachable host
+          set_fact:
+            Comment: "Host {{ inventory_hostname }} is not reachable over WinRM. Could not collect CPU metrics."
+
+        - name: Update ServiceNow incident for unreachable host
+          uri:
+            url: "{{ servicenow_instance }}/api/now/table/incident/{{ hostvars[inventory_hostname].sys_id }}"
+            method: PATCH
+            user: "{{ servicenow_user }}"
+            password: "{{ servicenow_password }}"
+            force_basic_auth: yes
+            body_format: json
+            headers:
+              Content-Type: "application/json"
+            body: >-
+              {% set body_data = {} %}
+              {% set _ = body_data.update({
+                          'assigned_to': '',
+                          'assignment_group': 'Group',
+                          'state': '9',
+                          'comments': Comment  | default('Host is not reachable over WinRM. Could not collect CPU metrics.')
+                        }) %}
+              {{ body_data | to_json }}
+          delegate_to: localhost
+          register: servicenow_unreachable_update
+          failed_when: servicenow_unreachable_update.status not in [200, 201, 202, 204]
+
+        - name: Ensure CSV file exists
+          ansible.builtin.file:
+            path: "{{ failed_server }}"
+            state: touch
+            mode: "0644"
+          delegate_to: "{{ csv_host }}"
+          vars:
+            ansible_user: "{{ ssh_user }}"
+            ansible_password: "{{ ssh_password }}"
+            ansible_connection: ssh
+            ansible_port: "{{ ssh_port }}"
+          run_once: true
+
+        - name: Append or increment CSV counter
+          ansible.builtin.shell: |
+            echo "{{ hostvars[inventory_hostname].incident_number }},{{ inventory_hostname }},{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}" >> "{{ failed_server }}"
+          delegate_to: "{{ csv_host }}"
+          vars:
+            ansible_user: "{{ ssh_user }}"
+            ansible_password: "{{ ssh_password }}"
+            ansible_connection: ssh
+            ansible_port: "{{ ssh_port }}"
+          changed_when: false
+
+        - name: End play for unreachable hosts
+          meta: end_host
+
+    - name: Poll Windows Systems 
+      import_tasks: cpu_poll_and_update.yml
+      when: winrm_check is succeeded
