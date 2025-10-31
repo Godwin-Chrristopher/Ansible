@@ -1,0 +1,445 @@
+---
+    - name: Get current CPU usage on {{ inventory_hostname }}
+      win_shell: |
+        try {
+            $cpu = [math]::Round((Get-Counter '\Processor(_Total)\% Processor Time').CounterSamples.CookedValue, 2)
+            $cpu=$cpu.ToString().Trim()
+            $cpu
+        } catch {
+            Write-Error "Failed to get CPU usage: $($_.Exception.Message)"
+            exit 1
+        }
+      register: current_cpu_poll_result
+      ignore_errors: true
+
+    # - name: Append or increment CSV counter
+    #   ansible.builtin.shell: |
+    #     CPU_VALUE="{{ current_cpu_poll_result.stdout | trim }}"
+    #     echo "{{ hostvars[inventory_hostname].incident_number }},{{ inventory_hostname }},{{ hostvars[inventory_hostname].sys_id }},${CPU_VALUE},{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}" >> "{{ csv_path }}"
+    #   delegate_to: "{{ csv_host }}"
+      # vars:
+      #   ansible_user: "{{ ssh_user }}"
+      #   ansible_password: "{{ ssh_password }}"
+      #   ansible_connection: ssh
+      #   ansible_port: "{{ ssh_port }}"
+      # changed_when: false
+
+    
+    - name: Append CPU row to CSV (delegated)
+      delegate_to: "{{ csv_host }}"
+      vars:
+        ansible_user: "{{ ssh_user }}"
+        ansible_password: "{{ ssh_password }}"
+        ansible_connection: ssh
+        ansible_port: "{{ ssh_port }}"      
+      ansible.builtin.lineinfile:
+        path: "{{ csv_path }}"
+        create: yes
+        insertafter: EOF
+        line: "{{ hostvars[inventory_hostname].incident_number }},{{ inventory_hostname }},{{ hostvars[inventory_hostname].sys_id }},{{ current_cpu_poll_result.stdout | trim | replace(',','.') }},{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}"
+      changed_when: true
+     
+
+    - name: Prune CSV entries older than 45 days
+      ansible.builtin.shell: |
+        CSV="{{ csv_path }}"
+        if [ -f "$CSV" ]; then
+          cutoff_epoch=$(date -d '45 days ago' +%s)
+          tmp="${CSV}.tmp"
+
+          # Keep header line
+          head -n 1 "$CSV" > "$tmp"
+
+          # Process each data line
+          tail -n +2 "$CSV" | while IFS=, read -r INC SERVER SYSID CPU TS; do
+            # Skip empty or malformed lines
+            [ -z "$TS" ] && continue
+
+            # Convert Timestamp (YYYY-MM-DDTHH:MM:SS) → seconds since epoch
+            entry_epoch=$(date -d "${TS%%T*}" +%s 2>/dev/null || echo 0)
+
+            # Keep lines newer than cutoff
+            if [ "$entry_epoch" -ge "$cutoff_epoch" ]; then
+              echo "$INC,$SERVER,$SYSID,$CPU,$TS" >> "$tmp"
+            fi
+          done
+
+          mv "$tmp" "$CSV"
+        fi
+      delegate_to: "{{ csv_host }}"
+      vars:
+        ansible_user: "{{ ssh_user }}"
+        ansible_password: "{{ ssh_password }}"
+        ansible_connection: ssh
+        ansible_port: "{{ ssh_port }}"
+      changed_when: false
+      run_once: true
+
+
+    - name: Read CSV file
+      community.general.read_csv:
+        path: "{{ csv_path }}"
+      delegate_to: "{{ csv_host }}"
+      vars:
+        ansible_user: "{{ ssh_user }}"
+        ansible_password: "{{ ssh_password }}"
+        ansible_connection: ssh
+        ansible_port: "{{ ssh_port }}"
+      register: csv_data
+
+    - name: Inventory incident
+      set_fact:
+        inventory_incidents: "{{ hostvars[inventory_hostname].incident_number }}"
+      delegate_to: localhost
+
+    - name: Filter rows matching inventory incidents
+      set_fact:
+        matching_inc_rows: "{{ csv_data.list | selectattr('INC', 'in', inventory_incidents) | list }}"
+      delegate_to: localhost
+
+    - name: Count duplicate incidents
+      set_fact:
+        duplicate_incident_count: "{{ matching_inc_rows | length }}"
+      delegate_to: localhost
+
+    - name: Show number of duplicate incidents
+      debug:
+        msg: "Number of duplicate incidents matching inventory: {{ duplicate_incident_count }}"
+      delegate_to: localhost
+
+    - name: Filter rows matching inventory servers
+      set_fact:
+        matching_server_rows: "{{ csv_data.list | selectattr('Server', 'in', inventory_hostname) | list }}"
+      delegate_to: localhost
+
+    - name: Count unique incidents for matching servers
+      set_fact:
+        unique_incident_count: "{{ matching_server_rows | map(attribute='INC') | unique | length }}"
+      delegate_to: localhost
+
+    - name: Show number of unique incidents for inventory servers
+      debug:
+        msg: "Number of unique incidents matching inventory servers: {{ unique_incident_count }}"
+      delegate_to: localhost
+
+    - name: Get current CPU top processes on {{ inventory_hostname }} (Poll {{ duplicate_incident_count }})
+      win_shell: |
+        try {
+             # Get total system memory for percentage calculation
+            $totalMemoryBytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+            $logicalProcessors = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+            
+            # Safely get CPU counter data, ignoring invalid samples
+            try {
+                $cpuCounters = Get-Counter '\Process(*)\% Processor Time' -ErrorAction Stop
+            }
+            catch {
+                $cpuCounters = Get-Counter '\Process(*)\% Processor Time' -ErrorAction SilentlyContinue
+            }
+            
+            # Filter out invalid or irrelevant data
+            $filtered = $cpuCounters.CounterSamples | Where-Object {
+                $_.InstanceName -ne '_Total' -and
+                $_.InstanceName -ne 'Idle' -and
+                $_.CookedValue -ge 0 -and
+                $_.Status -eq 0
+            }
+            
+            # Group by process name and sum CPU usage (some processes have multiple instances)
+            $grouped = $filtered | Group-Object InstanceName | ForEach-Object {
+                [PSCustomObject]@{
+                    ProcessName = $_.Name
+                    CPU         = [math]::Round((($_.Group | Measure-Object CookedValue -Sum).Sum) / $logicalProcessors, 2)
+                }
+            }
+            
+            # Sort by CPU usage and select top 10
+            $top10 = $grouped | Sort-Object CPU -Descending | Select-Object -First 10
+            
+            # Add memory usage percentage information
+            $top10WithMemory = $top10 | ForEach-Object {
+                $procName = $_.ProcessName
+                $processes = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq $procName }
+            
+                if ($processes) {
+                    $memBytes = ($processes | Measure-Object WorkingSet64 -Sum).Sum
+                    $memPercent = ($memBytes / $totalMemoryBytes) * 100
+                }
+                else {
+                    $memPercent = 0
+                }
+            
+                [PSCustomObject]@{
+                    ProcessName    = $procName
+                    CPU_Percent    = [math]::Round($_.CPU, 2)
+                    Memory_Percent = [math]::Round($memPercent, 2)
+                }
+            }
+            
+            # Display results
+            $TOP_PROCESS =$top10WithMemory | Sort-Object CPU_Percent -Descending 
+ 
+            $tableRows = $TOP_PROCESS | ForEach-Object {
+              "<tr><td>$($_.ProcessName)</td><td>$($_.CPU_Percent)</td><td>$($_.Memory_Percent)</td></tr>"
+            }
+            $HTMLBody = "
+            <html>
+            <head>
+            <style>
+            body { font-family: 'Segoe UI', Tahoma, sans-serif; }
+            .container { max-width: 700px; margin: 30px auto; padding: 25px; background: white; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            h2 {}
+            p { font-size: 16px; }
+            table { width: 50%; border-collapse: collapse; margin-top: 20px; }
+            th, td { border: 1px solid #ddd; padding: 12px; }
+            th {}
+            tr:nth-child(even) {}
+            tr:hover {}
+            </style>
+            </head>
+            <body>
+            <div>
+            <h2>CPU Utilization Report for {{ inventory_hostname }}</h2>
+            <table>
+            <tr><th>Process Name</th><th>CPU Usage %</th><th>Memory Usage %</th></tr>
+            $tableRows
+            </table>
+            </div>
+            </body>
+            </html>
+            "
+            Write-Output "$HTMLBody"
+        } catch {
+            Write-Error "Failed to get top processes: $($_.Exception.Message)"
+            exit 1
+        }
+      register: current_cpu_top_result
+      ignore_errors: true
+
+    - name: Set poll-specific comment message
+      set_fact:
+        poll_comment_message: |
+          Automated Poll Update {{ duplicate_incident_count }}:
+          Current CPU on {{ inventory_hostname }}: {{ current_cpu_poll_result.stdout | replace(',', '.') | default('N/A') }}%.
+          Top processes:
+          [code]
+          {{ current_cpu_top_result.stdout | default('Failed to retrieve top processes for this poll.') }}
+          [/code]
+      delegate_to: localhost
+
+    - name: Update ServiceNow incident with poll details
+      uri:
+        url: "{{ servicenow_instance }}/api/now/table/incident/{{ hostvars[inventory_hostname].sys_id }}"
+        method: PATCH
+        user: "{{ servicenow_user }}"
+        password: "{{ servicenow_password }}"
+        force_basic_auth: yes
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        body:
+          comments: "{{ poll_comment_message }}"
+      register: servicenow_poll_update_result
+      failed_when: servicenow_poll_update_result.status not in [200, 201, 202, 204]
+      ignore_errors: true
+      delegate_to: localhost
+
+    - name: Filter rows for target incident
+      set_fact:
+        incident_rows: "{{ csv_data.list | selectattr('INC', 'equalto', inventory_incidents) | list }}"
+      delegate_to: localhost
+
+    - block:
+        - name: Extract CPU% values as integers
+          set_fact:
+            cpu_values: "{{ incident_rows | map(attribute='CPU%') | map('int') | list }}"
+          delegate_to: localhost
+    
+        - name: Calculate min, max, and average CPU%
+          set_fact:
+            cpu_min: "{{ cpu_values | min }}"
+            cpu_max: "{{ cpu_values | max }}"
+            cpu_avg: "{{ (cpu_values | sum) / (cpu_values | length) | round(2) }}"
+          delegate_to: localhost
+    
+        - name: Analyze CPU usage
+          set_fact:
+            cpu_ok: "{{ cpu_values | default([]) | select('lt', cpu_threshold) | list | length == duplicate_incident_count }}"
+          when: cpu_values is defined
+          delegate_to: localhost
+    
+        - name: Process CSV data - Calculate Alert Count
+          set_fact:
+            alert_count: "{{ unique_incident_count }}"
+          delegate_to: localhost
+    
+        - name: Get CPU top processes again for summary
+          win_shell: |
+            try {
+            # Get total system memory for percentage calculation
+            $totalMemoryBytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+            $logicalProcessors = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+            
+            # Safely get CPU counter data, ignoring invalid samples
+            try {
+                $cpuCounters = Get-Counter '\Process(*)\% Processor Time' -ErrorAction Stop
+            }
+            catch {
+                $cpuCounters = Get-Counter '\Process(*)\% Processor Time' -ErrorAction SilentlyContinue
+            }
+            
+            # Filter out invalid or irrelevant data
+            $filtered = $cpuCounters.CounterSamples | Where-Object {
+                $_.InstanceName -ne '_Total' -and
+                $_.InstanceName -ne 'Idle' -and
+                $_.CookedValue -ge 0 -and
+                $_.Status -eq 0
+            }
+            
+            # Group by process name and sum CPU usage (some processes have multiple instances)
+            $grouped = $filtered | Group-Object InstanceName | ForEach-Object {
+                [PSCustomObject]@{
+                    ProcessName = $_.Name
+                    CPU         = [math]::Round((($_.Group | Measure-Object CookedValue -Sum).Sum) / $logicalProcessors, 2)
+                }
+            }
+            
+            # Sort by CPU usage and select top 10
+            $top10 = $grouped | Sort-Object CPU -Descending | Select-Object -First 10
+            
+            # Add memory usage percentage information
+            $top10WithMemory = $top10 | ForEach-Object {
+                $procName = $_.ProcessName
+                $processes = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq $procName }
+            
+                if ($processes) {
+                    $memBytes = ($processes | Measure-Object WorkingSet64 -Sum).Sum
+                    $memPercent = ($memBytes / $totalMemoryBytes) * 100
+                }
+                else {
+                    $memPercent = 0
+                }
+            
+                [PSCustomObject]@{
+                    ProcessName    = $procName
+                    CPU_Percent    = [math]::Round($_.CPU, 2)
+                    Memory_Percent = [math]::Round($memPercent, 2)
+                }
+            }
+            
+            # Display results
+            $TOP_PROCESS =$top10WithMemory | Sort-Object CPU_Percent -Descending 
+                $CPUuti = "Average: {{ cpu_avg | default('N/A') }}%"
+                $CPUPER = "Max: {{ cpu_max | default('N/A') }}%"
+                $tableRows = $TOP_PROCESS | ForEach-Object {
+                  "<tr><td>$($_.ProcessName)</td><td>$($_.CPU_Percent)</td><td>$($_.Memory_Percent)</td></tr>"
+                }
+                $HTMLBody = "
+                <html>
+                <head>
+                <style>
+                body { font-family: 'Segoe UI', Tahoma, sans-serif; }
+                .container { max-width: 700px; margin: 30px auto; padding: 25px; background: white; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+                h2 {}
+                p { font-size: 16px; }
+                table { width: 50%; border-collapse: collapse; margin-top: 20px; }
+                th, td { border: 1px solid #ddd; padding: 12px; }
+                th {}
+                tr:nth-child(even) {}
+                tr:hover {}
+                </style>
+                </head>
+                <body>
+                <h2>CPU Utilization Report for {{ inventory_hostname }}</h2>
+                <p><strong>Utilization Level:</strong> $CPUuti, $CPUPER</p>
+                <table>
+                <tr><th>Process Name</th><th>CPU Usage</th><th>Memory Usage (MB)</th></tr>
+                $tableRows
+                </table>
+                </body></html>
+                "
+                Write-Output "$HTMLBody"
+            } catch {
+                Write-Error "Failed to get top processes: $($_.Exception.Message)"
+                exit 1
+            }
+          register: cpu_top
+          ignore_errors: true
+    
+        - name: Set resolution/comment messages
+          set_fact:
+            resolution_message: |
+              Automated resolution: CPU normalized for {{ inventory_hostname }}.
+              Average CPU over {{ poll_count }} polls: {{ cpu_avg | default('N/A') }}%.
+              Max CPU during polls: {{ cpu_max | default('N/A') }}%.
+            resolution_comment: |
+              Automated resolution: CPU normalized for {{ inventory_hostname }}.
+              Average CPU over {{ poll_count }} polls: {{ cpu_avg | default('N/A') }}%.
+              Max CPU during polls: {{ cpu_max | default('N/A') }}%.
+              [code]
+              {{ cpu_top.stdout | default('Failed to retrieve top processes.') }}
+              [/code]
+            comment_message: |
+              CPU still high on {{ inventory_hostname }}, investigation needed.
+              Average CPU over {{ poll_count }} polls: {{ cpu_avg | default('N/A') }}%.
+              Max CPU during polls: {{ cpu_max | default('N/A') }}%.
+              Moving the Incident to new state again.
+              [code]
+              {{ cpu_top.stdout | default('Failed to retrieve top processes.') }}
+              [/code]
+          when: (cpu_ok is defined or (cpu_top is defined and cpu_top.stdout is defined)) and alert_count is defined and alert_count | int < 10
+          delegate_to: localhost
+    
+        - name: Set comment for recurring high CPU
+          set_fact:
+            comment_message: |
+              Investigation needed, recurring high CPU alerts detected. Potential case for upscaling.
+              Average CPU over {{ poll_count }} polls: {{ cpu_avg | default('N/A') }}%.
+              Max CPU during polls: {{ cpu_max | default('N/A') }}%.
+              Moving the Incident to new state again.
+              [code]
+              {{ cpu_top.stdout | default('Failed to retrieve top processes.') }}
+              [/code]
+          when: (cpu_ok is defined or (cpu_top is defined and cpu_top.stdout is defined)) and alert_count is defined and alert_count | int >= 10
+          delegate_to: localhost
+    
+        - name: Update ServiceNow incident (final state)
+          uri:
+            url: "{{ servicenow_instance }}/api/now/table/incident/{{ hostvars[inventory_hostname].sys_id }}"
+            method: PATCH
+            user: "{{ servicenow_user }}"
+            password: "{{ servicenow_password }}"
+            force_basic_auth: yes
+            body_format: json
+            headers:
+              Content-Type: "application/json"
+            body: >-
+              {% set body_data = {} %}
+              {% if cpu_ok | default(false) and (alert_count is not defined or alert_count | int < 10) %}
+                {% set _ = body_data.update({
+                            'state': '6',
+                            'assigned_to': 'User',
+                            'u_caused_by_a_change': 'no',
+                            'close_code': 'Solved (Permanently)',
+                            'close_notes': resolution_message | default('Automated resolution: CPU normalized.'),
+                            'work_notes': resolution_comment | default('Automated resolution: CPU normalized.')
+                          }) %}
+              {% elif alert_count is defined and alert_count | int >= 10 %}
+                {% set _ = body_data.update({
+                            'state': '2',
+                            'assigned_to': '',
+                            'comments': comment_message | default('Recurring high CPU detected.'),
+                            'work_notes': comment_message | default('Recurring high CPU detected.')
+                          }) %}
+              {% else %}
+                {% set _ = body_data.update({
+                            'state': '2',
+                            'assigned_to': '',
+                            'comments': comment_message | default('CPU still high, investigation needed.')
+                          }) %}
+              {% endif %}
+              {{ body_data | to_json }}
+          register: servicenow_update_result
+          failed_when: servicenow_update_result.status not in [200, 201, 202, 204]
+          delegate_to: localhost
+      when: duplicate_incident_count | int > 3
